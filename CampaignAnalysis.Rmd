@@ -1,0 +1,324 @@
+
+# 1 Business Understanding and Setup
+
+#### Client goals:
+##### Evaluate campaign ROI and identify data quality issues
+
+```{r}
+# Install packages and load libraries
+
+knitr::opts_chunk$set(echo = TRUE) # show code in knitted output for transparency
+library(data.table) #Load data.table for fast, efficient data manipulations
+library(stringdist) #Load stringdist for fuzzy matching on names/ addresses
+library(ggplot2) #Load ggplot2 for visualisation during EDA
+install.packages("targets")
+library(targets) # Load targets for optional reproducible pipeline
+```
+
+# 2 Data Understanding and Extraction (ETL: Extract)
+
+### Extract
+
+```{r}
+contacts <- fread("contacts.csv")  # Read contacts.csv; fast loading with data.table
+transactions <- fread("transactions.csv")
+```
+
+### Inspect
+
+```{r}
+str(contacts)  # Show structure; verify urn (numeric), age (NAs), and column types
+str(transactions)  # Show structure; confirm amount is numeric, urn matches type
+head(contacts)  # Preview first rows; check data format (e.g., names, addresses)
+head(transactions)  # Preview transactions; spot issues in amount or names
+summary(contacts)  # Summarize; check ranges (e.g., age 18-85, 27 NAs)
+summary(transactions)  # Summarize; verify amount range ($10-$100)
+contacts[duplicated(urn)]  # Check duplicate urns; expect none (confirmed)
+transactions[duplicated(urn)]  # Check duplicates; task assumes one trans per contact
+colSums(is.na(contacts))  # Count NAs; expect 27 in age, 0 elsewhere
+colSums(is.na(transactions))  # Count NAs; expect none in amount
+```
+
+# 3 Cleaning and Pre-processing
+
+```{r}
+contacts[, urn := as.character(urn)]  # Convert urn to character; ensures consistent joins (integer in data)
+transactions[, urn := as.character(urn)]  # Convert urn; avoids numeric mismatch issues
+
+transactions[is.na(amount), amount := 0]  # Set NA amounts to 0; precautionary (no NAs in data)
+
+contacts[, full_name := tolower(trimws(paste(first, last)))]  # Create column full_name; standardises names for fuzzy matching
+contacts[, full_address := tolower(trimws(paste(addr_line, addr_suburb, addr_postcode, addr_state)))]  # Create column full_address; combining fields for fuzzy matching
+transactions[, full_name := tolower(trimws(paste(first, last)))]  # Same for transactions; ensures name consistency
+transactions[, full_address := tolower(trimws(paste(addr_line, addr_suburb, addr_postcode, addr_state)))]  # Same for address; prepares for fuzzy matching
+```
+
+```{r}
+matched_exact <- merge(contacts, transactions, by = "urn", all.x = TRUE) # Left join keeps all 270 contacts, adds transactions where urn matches
+```
+
+```{r}
+unmatched_trans <- transactions[!urn %in% matched_exact[!is.na(amount), urn]] #Find transactions without exact urn match; expect ~3-4
+```
+
+```{r}
+if (nrow(unmatched_trans) > 0) {  # Check if unmatched transactions exist; proceed with fuzzy matching if true
+  dist_matrix_name <- stringdistmatrix(unmatched_trans$full_name, contacts$full_name, method = "lv")  # Compute Levenshtein distance; measures name similarity
+  dist_matrix_addr <- stringdistmatrix(unmatched_trans$full_address, contacts$full_address, method = "lv")  # Compute distance; measures address similarity
+  combined_dist <- (dist_matrix_name + dist_matrix_addr) / 2  # Average distances; balances name and address similarity
+  best_matches <- apply(combined_dist, 1, which.min)  # Find index of closest contact per unmatched transaction
+  min_dists <- apply(combined_dist, 1, min)  # Compute minimum distance for each unmatched transaction
+  good_idx <- min_dists < 5  # Threshold: <5 edits; tuned for matches like "J Welch" to "Janie Welch"
+  fuzzy_matches <- unmatched_trans[good_idx]  # Keep only good fuzzy matches; expect ~3-4
+  fuzzy_matches[, matched_urn := contacts$urn[best_matches[good_idx]]]  # Assign matched urn from contacts
+  setnames(fuzzy_matches, "urn", "original_urn")  # Rename original urn; tracks source for audit
+  fuzzy_matches[, urn := matched_urn]  # Set urn to matched urn; aligns with contacts for joining
+  fuzzy_matches <- fuzzy_matches[, .(urn, first, last, age, addr_line, addr_suburb, addr_postcode, addr_state, amount, full_name, full_address, original_urn, matched_urn)]  # Select columns; matches exact join structure
+  setnames(fuzzy_matches, c("first", "last", "age", "addr_line", "addr_suburb", "addr_postcode", "addr_state", "full_name", "full_address"), c("first.y", "last.y", "age.y", "addr_line.y", "addr_suburb.y", "addr_postcode.y", "addr_state.y", "full_name.y", "full_address.y"))  # Rename columns; matches merge suffixes
+  matched_all <- rbind(matched_exact, fuzzy_matches, fill = TRUE)  # Combine exact and fuzzy matches; fill handles column mismatches
+} else {
+  matched_all <- matched_exact  # Use exact matches only if no unmatched transactions
+}
+matched_all[, match_type := ifelse(is.na(amount), "No Match", "Exact")]  # Flag non-donors as "No Match"; donors as "Exact"
+matched_all[!is.na(matched_urn), match_type := "Fuzzy"]  # Flag fuzzy-matched donors as "Fuzzy"
+
+
+```
+
+# 4. Exploratory Data Analysis
+
+```{r}
+summary(matched_all$amount[!is.na(matched_all$amount)])
+```
+
+```{r}
+num_responders <- sum(!is.na(matched_all$amount))
+```
+
+```{r}
+response_rate <- num_responders/ nrow(contacts)
+```
+
+```{r}
+ggplot(matched_all[!is.na(amount)], aes(x = amount)) + geom_histogram(bins = 20) + theme_minimal() + labs(title = "Gift Amount Distribution")  # Histogram; shows gift spread ($10-$100)
+ggplot(matched_all, aes(x = match_type)) + geom_bar() + labs(title = "Match Types")  # Bar plot; shows exact (~26), fuzzy (~3-4), no match (~240)
+matched_all[!is.na(amount), .N, by = addr_state.x][, ggplot(.SD, aes(addr_state.x, N)) + geom_bar(stat = "identity") + labs(title = "Donors by State")]  # Bar plot; donors by state, expect QLD/VIC lead
+```
+
+# 5 Data Modelling and Analysis
+
+```{r}
+num_gifts <- sum(!is.na(matched_all$amount))  # Count non-NA amounts
+response_rate <- num_gifts / nrow(contacts)  # Proportion of donors
+avg_gift <- mean(matched_all$amount[!is.na(matched_all$amount)])  # Average gift; expect ~$44
+total_income <- sum(matched_all$amount[!is.na(matched_all$amount)])  # Sum of gifts; expect ~$1160
+cost <- 3 * nrow(contacts)  # Cost: $3 per contact; 270 * 3 = 810
+net_income <- total_income - cost  # Net income: total - cost; expect ~$1160 - $810 ≈ $350
+cat("Number of gifts:", num_gifts, "\n")  # Print number of gifts
+cat("Response rate:", round(response_rate, 4), "\n")  # Print rounded response rate for clarity
+cat("Average gift:", round(avg_gift, 2), "\n")  # Print rounded average gift for readability
+cat("Total income:", total_income, "\n")  # Print total income
+cat("Net income:", net_income, "\n")  # Print net income
+```
+
+
+
+```{r}
+library(leaflet)
+library(dplyr)
+library(ggplot2)
+```
+# Bubble Chart of Donations
+
+```{r}
+# Load plotly for interactivity (install if missing)
+if (!require(plotly)) install.packages("plotly")  # Install plotly for ggplotly
+library(plotly)  # For interactive ggplot
+
+# Filter donors from matched_all
+donors <- matched_all[!is.na(amount)]  # Filter donors; expect 28 rows
+donors[, age_bin := cut(age.x, breaks = c(0, 30, 50, 70, Inf), labels = c("18-30", "31-50", "51-70", "71+"))]  # Bin age.x (from contacts)
+
+# Bubble chart: x = age.x, y = jittered 0, size = amount, color = addr_state.x, alpha = amount
+p <- ggplot(donors, aes(x = age.x, y = jitter(rep(0, nrow(donors)), factor = 1), size = amount, color = addr_state.x, alpha = amount)) + 
+  geom_point() +
+  scale_size_continuous(range = c(3, 15), name = "Donation Amount ($)") +
+  scale_alpha_continuous(range = c(0.4, 1), name = "Donation Amount ($)") +
+  scale_color_brewer(palette = "Set1", name = "State") +
+  labs(title = "Donation Size by Age", x = "Age", y = "", color = "State", size = "Amount", alpha = "Amount") +
+  theme_minimal() +
+  theme(axis.text.y = element_blank(), axis.ticks.y = element_blank())
+
+# Static chart
+print(p)
+
+# Save for PPT
+ggsave("bubble_chart.png", p, width = 8, height = 6, dpi = 300)
+
+# Interactive chart
+ggplotly(p)
+
+```
+
+
+# Gifts by State
+
+```{r}
+gifts_by_state <- donors[, .N, by = addr_state.x]  # Count gifts per state (use addr_state.x)
+bar_chart <- ggplot(gifts_by_state, aes(x = addr_state.x, y = N, fill = addr_state.x)) +  # Create bar chart
+  geom_bar(stat = "identity") +  # Use identity for counts
+  labs(title = "Number of Gifts by State", x = "State", y = "Number of Gifts") +  # Add labels
+  theme_minimal() +  # Clean theme
+  scale_fill_brewer(palette = "Set2") +  # Use distinct colors
+  theme(legend.position = "none")  # Remove legend for clarity
+print(bar_chart)  # Display plot
+ggsave("gifts_by_state.png", bar_chart, width = 8, height = 6, dpi = 300)  # Save for PPT
+
+```
+# Match Type Distribution
+
+```{r}
+match_type_counts <- matched_all[, .N, by = match_type]  # Count by match type
+pie_chart <- ggplot(match_type_counts, aes(x = "", y = N, fill = match_type)) +  # Create pie chart
+  geom_bar(stat = "identity", width = 0.5) +  # Bar for pie
+  coord_polar("y", start = 0) +  # Convert to pie chart
+  labs(title = "Proportion of Match Types", fill = "Match Type") +  # Add labels
+  theme_void() +  # Remove axes for clean pie
+  scale_fill_brewer(palette = "Set1") +  # Use distinct colors
+  theme(legend.position = "right")  # Place legend on right
+print(pie_chart)  # Display plot
+ggsave("match_types.png", pie_chart, width = 8, height = 6, dpi = 300)  # Save for PPT
+
+```
+
+
+```{r}
+# 1. Histogram of Donation Amounts by Age Group
+p1 <- ggplot(donors, aes(x = amount, fill = age_bin)) +
+  geom_histogram(binwidth = 10, position = "dodge") +
+  scale_fill_brewer(palette = "Set2", name = "Age Group") +
+  labs(title = "Donation Amounts by Age Group", x = "Donation Amount ($)", y = "Count") +
+  theme_minimal()
+print(p1)
+ggsave("histogram_donations_age.png", p1, width = 8, height = 6, dpi = 300)  # Save for PPT
+ggplotly(p1)  # Interactive (hover for counts)
+```
+
+```{r}
+# 2. Boxplot of Donation Amounts by State
+p2 <- ggplot(donors, aes(x = addr_state.x, y = amount, fill = addr_state.x)) +
+  geom_boxplot() +
+  scale_fill_brewer(palette = "Set1", name = "State") +
+  labs(title = "Donation Amounts by State", x = "State", y = "Donation Amount ($)") +
+  theme_minimal() +
+  theme(legend.position = "none")
+print(p2)
+ggsave("boxplot_donations_state.png", p2, width = 8, height = 6, dpi = 300)  # Save for PPT
+ggplotly(p2)  # Interactive (hover for stats)
+```
+
+```{r}
+# Load required libraries
+library(ggplot2)
+library(plotly)
+
+# Ensure donors contains only matched donations
+donors <- matched_all[!is.na(amount)]  # Matched donors only for profitability
+
+# 2. Boxplot of Donation Amounts by State with Annotations
+p2 <- ggplot(donors, aes(x = addr_state.x, y = amount, fill = addr_state.x)) +
+  geom_boxplot() +
+  scale_fill_brewer(palette = "Set1", name = "State") +
+  labs(title = "Profitability by State: Donation Insights",
+       x = "State", y = "Donation Amount ($)") +
+  theme_minimal() +
+  theme(legend.position = "none") +
+  # Annotate Median (approximate values based on prior data)
+  annotate("text", x = 1, y = 42, label = "Typical Gift: ~$42", 
+           color = "black", size = 3.5, hjust = -0.1, vjust = 1.5) +  # QLD median
+  annotate("text", x = 2, y = 42, label = "Typical Gift: ~$42", 
+           color = "black", size = 3.5, hjust = -0.1, vjust = 1.5) +  # VIC median
+  annotate("text", x = 3, y = 37, label = "Typical Gift: ~$37", 
+           color = "black", size = 3.5, hjust = -0.1, vjust = 1.5) +  # NSW median
+  # Annotate IQR (middle 50% range)
+  annotate("text", x = 1, y = 50, label = "Most Common: $30-$70", 
+           color = "black", size = 3.5, hjust = -0.1, vjust = -0.5) +  # QLD IQR
+  annotate("text", x = 2, y = 45, label = "Most Common: $30-$60", 
+           color = "black", size = 3.5, hjust = -0.1, vjust = -0.5) +  # VIC IQR
+  annotate("text", x = 3, y = 37, label = "Most Common: $25-$50", 
+           color = "black", size = 3.5, hjust = -0.1, vjust = -0.5) +  # NSW IQR
+  # Annotate Whiskers (usual range)
+  annotate("text", x = 1, y = 25, label = "Usual Range: $30-$70", 
+           color = "black", size = 3.5, hjust = -0.1, vjust = 1.5) +  # QLD
+  annotate("text", x = 2, y = 25, label = "Usual Range: $30-$60", 
+           color = "black", size = 3.5, hjust = -0.1, vjust = 1.5) +  # VIC
+  annotate("text", x = 3, y = 20, label = "Usual Range: $25-$50", 
+           color = "black", size = 3.5, hjust = -0.1, vjust = 1.5) +  # NSW
+  # Annotate Outliers (biggest gifts)
+  annotate("text", x = 1, y = 95, label = "Biggest Gifts: $90-$100", 
+           color = "black", size = 3.5, hjust = -0.1, vjust = -0.5) +  # QLD
+  annotate("text", x = 2, y = 75, label = "Biggest Gifts: $70-$80", 
+           color = "black", size = 3.5, hjust = -0.1, vjust = -0.5) +  # VIC
+  annotate("text", x = 3, y = 60, label = "Biggest Gifts: $60", 
+           color = "black", size = 3.5, hjust = -0.1, vjust = -0.5)  # NSW
+
+# Display plot
+print(p2)
+
+# Save annotated plot as image
+ggsave("annotated_boxplot_profitability.png", p2, width = 10, height = 6, dpi = 300)
+
+# Interactive version for hover details
+ggplotly(p2)
+
+```
+
+
+
+```{r}
+# 3. Stacked Bar Chart of Match Types by State
+match_by_state <- matched_all[, .N, by = .(addr_state.x, match_type)]  # Count by state and match type
+p3 <- ggplot(match_by_state, aes(x = addr_state.x, y = N, fill = match_type)) +
+  geom_bar(stat = "identity") +
+  scale_fill_brewer(palette = "Set1", name = "Match Type") +
+  labs(title = "Match Types by State", x = "State", y = "Count") +
+  theme_minimal()
+print(p3)
+ggsave("stacked_match_state.png", p3, width = 8, height = 6, dpi = 300)  # Save for PPT
+ggplotly(p3)  # Interactive (hover for counts)
+```
+
+
+```{r}
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
