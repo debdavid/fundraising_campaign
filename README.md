@@ -1,5 +1,8 @@
 1. Purpose
-This repository provides a small, reproducible analysis of a direct-mail campaign using R. It calculates the campaign’s core KPIs, surfaces data quality issues (notably unmatched transactions), and emits reviewer-ready outputs—following consulting-grade practices for clarity, auditability, and ease of reuse.
+
+This repository provides a small, reproducible analysis of a direct-mail campaign using R. It calculates the campaign’s core KPIs, surfaces data quality issues 
+
+(notably unmatched transactions), and emits reviewer-ready outputs—following consulting-grade practices for clarity, auditability, and ease of reuse.
 
 2. Approach (ELT rationale)
 A pragmatic ELT pattern is used:
